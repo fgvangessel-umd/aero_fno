@@ -5,6 +5,7 @@ from matplotlib import cm
 import matplotlib.tri as tri
 from reorder import reorder_coords
 import glob
+from modulus.sym.geometry.primitives_2d import Polygon
 
 def convert_list_to_array(input_list):
     # Initialize an empty list to store all the numbers

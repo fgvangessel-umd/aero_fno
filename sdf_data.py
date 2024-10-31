@@ -7,6 +7,18 @@ from reorder import reorder_coords
 import glob
 from functions import *
 
+def get_sample_points(case, slce):
+    '''
+    Get poitn in domain at which we sample the SDF
+    '''
+    fname = 'data/field_data/'+case+'_'+slce+'_fields.npz'
+    data = np.load(fname)
+    Xi = data['x']
+    Yi = data['y']
+
+    sxy = np.concatenate((Xi.reshape(-1,1), Yi.reshape(-1,1)), axis=1)
+    return sxy
+
 
 # Define clipped region
 xmin, xmax = -0.75, 1.75
@@ -23,7 +35,8 @@ Xi, Yi = np.meshgrid(xi, yi)
 ncols = 5
 nvars = 8
 
-cases = glob.glob('../field_data/case*')
+cases = glob.glob('data/slice_data/case*')
+print(cases)
 
 for d in cases:
     slices = glob.glob(d+'/fc*_slices.dat')
@@ -33,23 +46,22 @@ for d in cases:
 
         case = fname.split('_')[2].split('/')[0]
         slce = fname.split('_')[3]
-        print(case+'_'+slce)
-        
+        print(case, slce)
         
         d2_df = read_slice_data(s)
 
         
-        sxy = np.concatenate((Xi.reshape(-1,1), Yi.reshape(-1,1)), axis=1)
+        sxy = get_sample_points(case, slce)
+        
         sdf = gen_sdf_data(d2_df, sxy)
 
         # Plot
-        fname = f'sdf_data/sdf'+case+'_'+slce+'.png'
+        fname = f'data/sdf_data/sdf'+case+'_'+slce+'.png'
         plot_sdf(xy, sdf, sb, fname)
 
         # Save data
-        fname = f'sdf_data/sdf'+case+'_'+slce+'.npz'
+        fname = f'data/sdf_data/sdf'+case+'_'+slce+'.npz'
         save_sdf(xy, sdf, sb, fname)
 
         break
-
     break
