@@ -57,11 +57,11 @@ for d in cases:
 
         # Plot
         fname = f'data/sdf_data/sdf'+case+'_'+slce+'.png'
-        plot_sdf(xy, sdf, sb, fname)
+        plot_sdf(sxy, sdf, fname)
 
         # Save data
         fname = f'data/sdf_data/sdf'+case+'_'+slce+'.npz'
-        save_sdf(xy, sdf, sb, fname)
+        save_sdf(sxy, sdf, fname)
 
         break
     break

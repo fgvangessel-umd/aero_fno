@@ -149,7 +149,7 @@ def plot_sdf(xy, sdf, sb, fname):
     
     return fig, ax
 
-def save_sdf(xy, sdf, sb, fname):
+def save_sdf(xy, sdf, fname):
     x, y = xy['x'], xy['y']
     s, s_x, s_y = sdf['sdf'], sdf['sdf__x'], sdf['sdf__y']
     
