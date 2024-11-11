@@ -1,0 +1,6 @@
+grid:
+  ngrid: 256
+  xmin: -0.75
+  xmax:  1.75
+  ymin: -0.75 
+  ymax:  0.75
