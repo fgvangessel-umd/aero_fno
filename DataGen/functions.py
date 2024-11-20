@@ -21,7 +21,7 @@ def convert_list_to_array(input_list):
     # Convert the list of all numbers to a numpy array
     return np.array(all_numbers)
 
-def mask_dims(vars, xmin, max, ymin, ymax):
+def mask_dims(vars, xmin, xmax, ymin, ymax):
     # Apply z mask
     mask = vars[2]<0.5
     vars = [var[mask] for var in vars]
@@ -44,6 +44,9 @@ def read_field_data(s, xmin, xmax, ymin, ymax):
     # Extract symm zone
     nnods = []
     nelms = []
+
+    ncols = 5
+    nvars = 8
 
     fvars = []
 

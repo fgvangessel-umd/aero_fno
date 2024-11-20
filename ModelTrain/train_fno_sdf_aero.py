@@ -20,13 +20,14 @@ from math import ceil
 import sys
 import numpy as np
 from matplotlib import pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+import pickle
 
 import torch
 from torch.nn import MSELoss
 from torch.optim import Adam, lr_scheduler
 
 from modulus.models.fno import FNO
-from modulus.datapipes.benchmarks.darcy import Darcy2D
 from modulus.distributed import DistributedManager
 from modulus.utils import StaticCaptureTraining, StaticCaptureEvaluateNoGrad
 from modulus.launch.utils import load_checkpoint, save_checkpoint
@@ -35,17 +36,17 @@ from modulus.launch.logging.mlflow import initialize_mlflow
 
 from validator import GridValidator
 
+from data_funcs import load_data, scale_data, to_device, to_cpu, loss_mask
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
 @hydra.main(version_base="1.3", config_path=".", config_name="config.yaml")
 def aero_sdf_trainer(cfg: DictConfig) -> None:
-    """Training for the 2D Darcy flow benchmark problem.
+    """Training for the Aero Prediction Task
 
-    This training script demonstrates how to set up a data-driven model for a 2D Darcy flow
-    using Fourier Neural Operators (FNO) and acts as a benchmark for this type of operator.
-    Training data is generated in-situ via the Darcy2D data loader from Modulus. Darcy2D
-    continuously generates data previously unseen by the model, i.e. the model is trained
-    over a single epoch of a training set consisting of
-    (cfg.training.max_pseudo_epochs*cfg.training.pseudo_epoch_sample_size) unique samples.
-    Pseudo_epochs were introduced to leverage the LaunchLogger and its MLFlow integration.
+    This script was adapted from the 2D Darcy FNO example provided from NVIDIA Modulus
+
     """
     DistributedManager.initialize()  # Only call this once in the entire script!
     dist = DistributedManager()  # call if required elsewhere
@@ -81,67 +82,36 @@ def aero_sdf_trainer(cfg: DictConfig) -> None:
     scheduler = lr_scheduler.LambdaLR(
         optimizer, lr_lambda=lambda step: cfg.scheduler.decay_rate**step
     )
-    
-    # Load Aero FNO Data
-    ndata = 20
-    datasets = ['0_{0:03}'.format(i) for i in range(ndata)]
-    
-    pressure = np.zeros((ndata,cfg.arch.decoder.out_features,cfg.training.resolution, cfg.training.resolution))
-    sdf = np.zeros((ndata,cfg.arch.decoder.out_features,cfg.training.resolution, cfg.training.resolution))
-    
-    for i, dataset in enumerate(datasets):
-        data = np.load('data/field_data/'+dataset+'_fields.npz')
-        Xi = data['x']
-        Yi = data['y']
-        p = data['p']
-        vx = data['vx']
-        vy = data['vy']
 
-        Xi = Xi[:cfg.training.resolution,:cfg.training.resolution]
-        Yi = Yi[:cfg.training.resolution,:cfg.training.resolution]
-        p  = p[:cfg.training.resolution,:cfg.training.resolution]
+    data_dir = cfg.data.data_dir
 
-        pressure[i,0,:,:] = p
+    # Load mean and variance scaling parameters
+    with open(data_dir+cfg.data.files.norm, 'rb') as f: 
+        stats_dict = pickle.load(f)
 
-        data = np.load('data/sdf_data/sdf_'+dataset+'.npz')
-        x = data['x']
-        y = data['y']
-        s = data['s']
-        s_x = data['s_x']
-        s_y = data['s_y']
+    # Read in data counts to avoid traininig on padded tensor values
+    with open(data_dir+cfg.data.files.counts, 'r') as f:
+        Ntrain = int(f.readline().strip())
+        Nval = int(f.readline().strip())
+        Ntest = int(f.readline().strip())
 
-        x = x.reshape((264,264))
-        y = y.reshape((264,264))
-        s = s.reshape((264,264))
+    # Load input and output training data
+    data_dir = cfg.data.data_dir
+    inputs_train, outputs_train = load_data(data_dir+cfg.data.files.input_train, data_dir+cfg.data.files.output_train)
+    inputs_val,   outputs_val   = load_data(data_dir+cfg.data.files.input_val, data_dir+cfg.data.files.output_val)
 
-        s  = s[:cfg.training.resolution,:cfg.training.resolution]
+    # Create loss masks
+    mask_train = loss_mask(inputs_train)
+    mask_val   = loss_mask(inputs_val)
+    mask_train, mask_val = to_device(mask_train, mask_val, dist.device)
 
-        sdf[i,0,:,:] = s
+    # Standard scale training data
+    inputs_train, outputs_train = scale_data(inputs_train, outputs_train, stats_dict)
+    inputs_val, outputs_val = scale_data(inputs_val, outputs_val, stats_dict)
 
-    # Standard Scale datasets
-    sdf = (sdf - np.mean(sdf)) /np.std(sdf)
-    pressure = (pressure - np.mean(pressure)) / np.std(pressure)
-
-    fig, axs = plt.subplots(nrows=10, ncols=4, figsize=(16,24))
-
-    for i in range(ndata):
-        if i<10:
-            axs[i,0].contourf(Xi, Yi, sdf[i,0,:,:], levels=14, linewidths=0.5, colors='k')
-            cntr2 = axs[i,0].contourf(Xi, Yi, sdf[i,0,:,:], levels=14, cmap="RdBu_r")
-            axs[i,1].contourf(Xi, Yi, pressure[i,0,:,:], levels=14, linewidths=0.5, colors='k')
-            cntr2 = axs[i,1].contourf(Xi, Yi, pressure[i,0,:,:], levels=14, cmap="RdBu_r")
-        else:
-            j = i-10
-            axs[j,2].contourf(Xi, Yi, sdf[i,0,:,:], levels=14, linewidths=0.5, colors='k')
-            cntr2 = axs[j,2].contourf(Xi, Yi, sdf[i,0,:,:], levels=14, cmap="RdBu_r")
-            axs[j,3].contourf(Xi, Yi, pressure[i,0,:,:], levels=14, linewidths=0.5, colors='k')
-            cntr2 = axs[j,3].contourf(Xi, Yi, pressure[i,0,:,:], levels=14, cmap="RdBu_r")
-
-    plt.savefig('data.png')
-
-    # Create single training batch
-    batch = {'sdf': torch.tensor(sdf, dtype=torch.float).to(dist.device), 'pressure': torch.tensor(pressure, dtype=torch.float).to(dist.device)}
-    print(batch['sdf'].type())
+    # Move data to device
+    inputs_train, outputs_train = to_device(inputs_train, outputs_train, dist.device)
+    inputs_val, outputs_val = to_device(inputs_val, outputs_val, dist.device)
 
     validator = GridValidator(loss_fun=MSELoss(reduction="mean"))
 
@@ -151,24 +121,24 @@ def aero_sdf_trainer(cfg: DictConfig) -> None:
         "scheduler": scheduler,
         "models": model,
     }
-    loaded_pseudo_epoch = load_checkpoint(device=dist.device, **ckpt_args)
+    loaded_epoch = load_checkpoint(device=dist.device, **ckpt_args)
 
     # calculate steps per pseudo epoch
-    steps_per_pseudo_epoch = ceil(
-        cfg.training.pseudo_epoch_sample_size / cfg.training.batch_size
+    steps_per_epoch = ceil(
+        Ntrain / cfg.training.batch_size
     )
-    validation_iters = ceil(cfg.validation.sample_size / cfg.training.batch_size)
+    validation_iters = ceil(Nval / cfg.training.batch_size)
     log_args = {
         "name_space": "train",
-        "num_mini_batch": steps_per_pseudo_epoch,
+        "num_mini_batch": steps_per_epoch,
         "epoch_alert_freq": 1,
     }
-    if cfg.training.pseudo_epoch_sample_size % cfg.training.batch_size != 0:
+    if Ntrain % cfg.training.batch_size != 0:
         log.warning(
             f"increased pseudo_epoch_sample_size to multiple of \
-                      batch size: {steps_per_pseudo_epoch*cfg.training.batch_size}"
+                      batch size: {steps_per_epoch*cfg.training.batch_size}"
         )
-    if cfg.validation.sample_size % cfg.training.batch_size != 0:
+    if Nval % cfg.training.batch_size != 0:
         log.warning(
             f"increased validation sample size to multiple of \
                       batch size: {validation_iters*cfg.training.batch_size}"
@@ -178,9 +148,9 @@ def aero_sdf_trainer(cfg: DictConfig) -> None:
     @StaticCaptureTraining(
         model=model, optim=optimizer, logger=log, use_amp=False, use_graphs=False
     )
-    def forward_train(invars, target):
+    def forward_train(invars, target, mask):
         pred = model(invars)
-        loss = loss_fun(pred, target)
+        loss = loss_fun(pred*mask, target*mask)
         return loss
 
     @StaticCaptureEvaluateNoGrad(
@@ -189,135 +159,98 @@ def aero_sdf_trainer(cfg: DictConfig) -> None:
     def forward_eval(invars):
         return model(invars)
 
-    if loaded_pseudo_epoch == 0:
+    if loaded_epoch == 0:
         log.success("Training started...")
     else:
-        log.warning(f"Resuming training from pseudo epoch {loaded_pseudo_epoch+1}.")
+        log.warning(f"Resuming training from epoch {loaded_epoch+1}.")
 
-    #for pseudo_epoch in range(
-    #    max(1, loaded_pseudo_epoch + 1), cfg.training.max_pseudo_epochs + 1
-    #):
-    for pseudo_epoch in range(1):
-        # Wrap epoch in launch logger for console / MLFlow logs
-        with LaunchLogger(**log_args, epoch=pseudo_epoch) as logger:
-            #for _, batch in zip(range(steps_per_pseudo_epoch), dataloader):
-            for _ in range(1000):
-                loss = forward_train(batch["sdf"], batch["pressure"])
-                print("loss: %4.3e"%loss.detach())
-                logger.log_minibatch({"loss": loss.detach()})
-            logger.log_epoch({"Learning Rate": optimizer.param_groups[0]["lr"]})
+    # Usage
+    num_params = count_parameters(model)
+    print(f'The model has {num_params:,} trainable parameters')
 
+    for epoch in range(cfg.training.max_epochs):
+        for ibatch in range(steps_per_epoch):
+            loss = forward_train(inputs_train[ibatch,:,:,:,:], \
+                                 outputs_train[ibatch,:,:,:,:], \
+                                 mask_train[ibatch, :, :, :, :])
 
-        # save checkpoint
-        #if pseudo_epoch % cfg.training.rec_results_freq == 0:
-        if True:
-            save_checkpoint(**ckpt_args, epoch=pseudo_epoch)
+        if epoch%cfg.validation.validation_epochs==0:
+            save_checkpoint(**ckpt_args, epoch=epoch)
+            print("loss: %4.3e"%loss.detach())
 
-        # validation step
-        #if pseudo_epoch % cfg.validation.validation_pseudo_epochs == 0:
-        if True:
-            with LaunchLogger("valid", epoch=pseudo_epoch) as logger:
+            with LaunchLogger("valid", epoch=epoch) as logger:
                 total_loss = 0.0
-                #for _, batch in zip(range(validation_iters), dataloader):
-                for i in range(1):
-                    val_loss = validator.compare(
-                        batch["sdf"],
-                        batch["pressure"],
-                        forward_eval(batch["sdf"]),
-                        pseudo_epoch,
-                        logger,
-                    )
+                for i in range(validation_iters):
+                    mask = mask_val[i, :, :, :, :]
+                    #val_loss = validator.compare(
+                    #    inputs_val[i,:,:,:,:],
+                    #    outputs_val[i,:,:,:,:]*mask,
+                    #    forward_eval(inputs_val[i,:,:,:,:]*mask),
+                    #    epoch,
+                    #    logger,
+                    #)
+                    val_loss = forward_train(inputs_val[i,:,:,:,:], \
+                                             outputs_val[i,:,:,:,:], \
+                                             mask_val[i, :, :, :, :]).detach()
                     total_loss += val_loss
                 logger.log_epoch({"Validation error": total_loss / validation_iters})
 
-        # update learning rate
-        if pseudo_epoch % cfg.scheduler.decay_pseudo_epochs == 0:
-            scheduler.step()
+    ###
+    ###
+    ###
+    save_checkpoint(**ckpt_args, epoch=epoch)
 
-    save_checkpoint(**ckpt_args, epoch=cfg.training.max_pseudo_epochs)
-    log.success("Training completed *yay*")
+    # Visualize predictions on validation dataset
+    for ibatch in range(2):
 
-    # Load validation dataset
-    datasets = ['0_{0:03}'.format(i) for i in range(20,25)]
-    ndata = len(datasets)
+        invars = inputs_val[ibatch,:,:,:,:]
+        pred = model(invars)
+        target = outputs_val[ibatch,:,:,:,:]
 
-    pressure_val = np.zeros((ndata,cfg.arch.decoder.out_features,cfg.training.resolution, cfg.training.resolution))
-    sdf_val = np.zeros((ndata,cfg.arch.decoder.out_features,cfg.training.resolution, cfg.training.resolution))
-    
-    for i, dataset in enumerate(datasets):
-        data = np.load('data/field_data/'+dataset+'_fields.npz')
-        Xi = data['x']
-        Yi = data['y']
-        p = data['p']
-        vx = data['vx']
-        vy = data['vy']
+        masked_pred = pred*mask_val[ibatch, :, :, :, :]
+        masked_target = target*mask_val[ibatch, :, :, :, :]
 
-        Xi = Xi[:cfg.training.resolution,:cfg.training.resolution]
-        Yi = Yi[:cfg.training.resolution,:cfg.training.resolution]
-        p  = p[:cfg.training.resolution,:cfg.training.resolution]
+        for iplot in range(32):
+            fig, axs = plt.subplots(nrows=3, ncols=5, figsize=(18,12))
 
-        pressure_val[i,0,:,:] = p
+            mp, mt = to_cpu(masked_pred[iplot,:,:,:], masked_target[iplot,:,:,:])
+            m, inv = to_cpu(mask_val[ibatch, :, :, :, :], invars)
 
-        data = np.load('data/sdf_data/sdf_'+dataset+'.npz')
-        x = data['x']
-        y = data['y']
-        s = data['s']
-        s_x = data['s_x']
-        s_y = data['s_y']
+            for i in range(5):
+                axs[0,i].contourf(inv[iplot, i, :, :]*m[iplot, 0, :, :], levels=14, colors='k')
+                cntr = axs[0, i].contourf(inv[iplot, i, :, :]*m[iplot, 0, :, :], levels=14, cmap="RdBu_r")
+                
+                # Add colorbar above each subplot in first row
+                #divider = make_axes_locatable(axs[0,i])
+                #cax = divider.append_axes('top', size='5%', pad=0.05)
+                #fig.colorbar(cntr, cax=cax, orientation='horizontal')
+                #cax.xaxis.set_ticks_position('top')  # Put ticks on top
 
-        x = x.reshape((264,264))
-        y = y.reshape((264,264))
-        s = s.reshape((264,264))
+            for i in range(3):
+                axs[1,i].contourf(mt[i,:,:], levels=14, colors='k')
+                cntr = axs[1, i].contourf(mt[i,:,:], levels=14, cmap="RdBu_r")
 
-        s = s[:cfg.training.resolution,:cfg.training.resolution]
+                # Add colorbar below each subplot in second row
+                #divider = make_axes_locatable(axs[1, i])
+                #cax = divider.append_axes('bottom', size='5%', pad=0.05)
+                #fig.colorbar(cntr, cax=cax, orientation='horizontal')
 
-        sdf_val[i,0,:,:] = s
+            for i in range(3):
+                axs[2,i].contourf(mp[i,:,:], levels=14, colors='k')
+                cntr = axs[2,i].contourf(mp[i,:,:], levels=14, cmap="RdBu_r")
 
-    # Standard Scale datasets
-    sdf_val = (sdf_val - np.mean(sdf)) /np.std(sdf)
-    pressure_val = (pressure_val - np.mean(pressure)) / np.std(pressure)
+                # Add colorbar below each subplot in second row
+                #divider = make_axes_locatable(axs[2, i])
+                #cax = divider.append_axes('bottom', size='5%', pad=0.05)
+                #fig.colorbar(cntr, cax=cax, orientation='horizontal')
 
-    # Create single validation training batch
-    batch_val = {'sdf': torch.tensor(sdf_val, dtype=torch.float).to(dist.device), 'pressure': torch.tensor(pressure_val, dtype=torch.float).to(dist.device)}
 
-    preds_val = forward_eval(batch_val["sdf"]).detach().cpu().numpy()
+            for ax in axs.flat:
+                ax.set_xticks([])
+                ax.set_yticks([])
 
-    fig, axs = plt.subplots(nrows=ndata, ncols=4, figsize=(30,24))
-
-    for i in range(ndata):
-        axs[i,0].contourf(Xi, Yi, sdf_val[i,0,:,:], levels=14, linewidths=0.5, colors='k')
-        cntr2 = axs[i,0].contourf(Xi, Yi, sdf_val[i,0,:,:], levels=14, cmap="RdBu_r")
-
-        axs[i,1].contourf(Xi, Yi, preds_val[i,0,:,:], levels=14, linewidths=0.5, colors='k')
-        cntr2 = axs[i,1].contourf(Xi, Yi, preds_val[i,0,:,:], levels=14, cmap="RdBu_r")
-
-        axs[i,2].contourf(Xi, Yi, pressure_val[i,0,:,:], levels=14, linewidths=0.5, colors='k')
-        cntr2 = axs[i,2].contourf(Xi, Yi, pressure_val[i,0,:,:], levels=14, cmap="RdBu_r")
-
-        axs[i,3].contourf(Xi, Yi, pressure_val[i,0,:,:]-preds_val[i,0,:,:], levels=14, linewidths=0.5, colors='k')
-        cntr2 = axs[i,3].contourf(Xi, Yi, pressure_val[i,0,:,:]-preds_val[i,0,:,:], levels=14, cmap="RdBu_r")
-
-    plt.savefig('preds_val.png')
-
-    #Trianing prediction
-    preds = forward_eval(batch["sdf"]).detach().cpu().numpy()
-
-    fig, axs = plt.subplots(nrows=6, ncols=4, figsize=(30,24))
-
-    for i in range(6):
-        axs[i,0].contourf(Xi, Yi, sdf[i,0,:,:], levels=14, linewidths=0.5, colors='k')
-        cntr2 = axs[i,0].contourf(Xi, Yi, sdf[i,0,:,:], levels=14, cmap="RdBu_r")
-
-        axs[i,1].contourf(Xi, Yi, preds[i,0,:,:], levels=14, linewidths=0.5, colors='k')
-        cntr2 = axs[i,1].contourf(Xi, Yi, preds[i,0,:,:], levels=14, cmap="RdBu_r")
-
-        axs[i,2].contourf(Xi, Yi, pressure[i,0,:,:], levels=14, linewidths=0.5, colors='k')
-        cntr2 = axs[i,2].contourf(Xi, Yi, pressure[i,0,:,:], levels=14, cmap="RdBu_r")
-
-        axs[i,3].contourf(Xi, Yi, pressure[i,0,:,:]-preds[i,0,:,:], levels=14, linewidths=0.5, colors='k')
-        cntr2 = axs[i,3].contourf(Xi, Yi, pressure[i,0,:,:]-preds[i,0,:,:], levels=14, cmap="RdBu_r")
-
-    plt.savefig('preds.png')
+            plt.savefig('preds_val_'+str(ibatch)+'_'+str(iplot)+'.png')
+            plt.close()
 
 if __name__ == "__main__":
     aero_sdf_trainer()
