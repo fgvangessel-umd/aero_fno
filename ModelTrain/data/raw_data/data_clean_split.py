@@ -3,35 +3,62 @@ import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 import pickle
-import sys
+import sys, os
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+from itertools import chain
+import gc
+
+def process_chunk(chunk_data, chunk_start, aero_dict, chunk_size):
+    """Process a chunk of data and return inputs and outputs arrays"""
+    chunk_inputs = np.zeros((chunk_size, 5, 256, 256), dtype=np.float32)
+    chunk_outputs = np.zeros((chunk_size, 3, 256, 256), dtype=np.float32)
+    
+    for i, dname in enumerate(chunk_data):
+        try:
+            # Input data
+            with np.load('sdfs/sdf_'+dname+'.npz') as data:
+                case = dname.split('_')[0]
+                
+                # Copy data directly into arrays
+                chunk_inputs[i,0] = data['x']
+                chunk_inputs[i,1] = data['y']
+                chunk_inputs[i,2] = data['s']
+                chunk_inputs[i,3] = np.ones((256, 256), dtype=np.float32) * aero_dict[case]['mach']
+                chunk_inputs[i,4] = np.ones((256, 256), dtype=np.float32) * aero_dict[case]['reynolds']
+
+            # Output data
+            with np.load('fields/fields_'+dname+'.npz') as data:
+                chunk_outputs[i,0] = data['p']
+                chunk_outputs[i,1] = data['vx']
+                chunk_outputs[i,2] = data['vy']
+                
+        except Exception as e:
+            print(f"Error processing {dname}: {str(e)}")
+            return None, None
+            
+        if i % 100 == 0:
+            print(f"Processing item {chunk_start + i}")
+            gc.collect()
+    
+    return chunk_inputs, chunk_outputs
 
 # Open aero conditions dictionary
 with open('aero_dict.pkl', 'rb') as f:
     aero_dict = pickle.load(f)
 
-# Get available cases and slice (all available field data) 
-field_data_names = glob.glob('fields/*')
-field_data_names = [s[14:-4] for s in field_data_names]
-field_data_cases = list(set([s.split('_')[0] for s in field_data_names]))
+# Load dictionary of unique cases
+with open('unique_slices_dict.pkl', 'rb') as handle:
+    unique_slices_dict = pickle.load(handle)
 
-# Subsample all data down into fraction
-frac = 0.1 # Keep only this fraction of slices from all cases
-n = 12     # Keep only this number of slices from each case
-
+# Create list of all unique data
 data_list = []
 ndata = 0
-for case in field_data_cases:
+for case, slices in unique_slices_dict.items():
     if case=='0':
         continue
-
-    data_names = [s for s in field_data_names if s.startswith(case+'_')]
-    arr = np.array(data_names)
-    np.random.shuffle(arr)
-    data_names = list(data_names[:n])
-
-    for dname in data_names:
-        data_list.append(dname)
+    data_names = [case+'_'+slc for slc in slices]
+    data_list.append(data_names)
+data_list = list(chain(*data_list))
 
 # Segment available datasets into train-validate-test split
 arr = np.array(data_list)
@@ -41,8 +68,8 @@ np.random.shuffle(arr)
 
 # Calculate split points
 n = len(arr)
-first_split = int(32*16) #int(0.8 * n)
-second_split = int(32*2)+first_split #int(0.9 * n)
+first_split = int(0.8 * n)
+second_split = int(0.9 * n)
 
 # Split the array
 train_split = arr[:first_split].tolist()
@@ -51,54 +78,74 @@ test_split = arr[second_split:].tolist()
 
 Ntrain, Nval, Ntest = len(train_split), len(val_split), len(test_split)
     
-# Calculate mean/var statistic of input and output data from training set only
-X  = np.zeros((Ntrain, 256, 256))
-Y  = np.zeros((Ntrain, 256, 256))
-S  = np.zeros((Ntrain, 256, 256))
-Ma = np.zeros((Ntrain, 256, 256))
-Re = np.zeros((Ntrain, 256, 256))
+# Process data in chunks
+chunk_size = 500  # Adjust this based on available memory
+num_chunks = (Ntrain + chunk_size - 1) // chunk_size
 
-P  = np.zeros((Ntrain, 256, 256))
-VX = np.zeros((Ntrain, 256, 256))
-VY = np.zeros((Ntrain, 256, 256))
+# Create temporary directory for chunks if it doesn't exist
+os.makedirs('temp_chunks', exist_ok=True)
 
-nbatch = 32
+# Process each chunk
+for chunk_idx in range(num_chunks):
+    print(f"\nProcessing chunk {chunk_idx + 1}/{num_chunks}")
+    start_idx = chunk_idx * chunk_size
+    end_idx = min((chunk_idx + 1) * chunk_size, Ntrain)
+    current_chunk_size = end_idx - start_idx
+    
+    # Get current chunk data
+    chunk_data = train_split[start_idx:end_idx]
+    
+    # Process chunk
+    chunk_inputs, chunk_outputs = process_chunk(chunk_data, start_idx, aero_dict, current_chunk_size)
+    
+    if chunk_inputs is None:
+        print(f"Error processing chunk {chunk_idx + 1}")
+        continue
+        
+    # Save chunk to disk
+    np.savez_compressed(
+        f'temp_chunks/chunk_{chunk_idx}.npz',
+        inputs=chunk_inputs,
+        outputs=chunk_outputs
+    )
+    
+    # Clear memory
+    del chunk_inputs, chunk_outputs
+    gc.collect()
 
-print(Ntrain)
-print(Ntrain//nbatch)
-inputs = np.zeros((Ntrain//nbatch+1, nbatch, 5, 256, 256))
-outputs = np.zeros((Ntrain//nbatch+1, nbatch, 3, 256, 256))
+# Combine chunks into final arrays
+print("\nCombining chunks into final arrays...")
+inputs = np.zeros((Ntrain, 5, 256, 256), dtype=np.float32)
+outputs = np.zeros((Ntrain, 3, 256, 256), dtype=np.float32)
 
-ibatch = 0
-for i, dname in enumerate(train_split):
+for chunk_idx in range(num_chunks):
+    start_idx = chunk_idx * chunk_size
+    end_idx = min((chunk_idx + 1) * chunk_size, Ntrain)
+    
+    # Load chunk
+    chunk_data = np.load(f'temp_chunks/chunk_{chunk_idx}.npz')
+    inputs[start_idx:end_idx] = chunk_data['inputs']
+    outputs[start_idx:end_idx] = chunk_data['outputs']
+    
+    # Clean up
+    del chunk_data
+    gc.collect()
 
-    # Input data
-    data = np.load('sdfs/sdf_'+dname+'.npz')
-    X[i,:,:] = data['x']
-    Y[i,:,:] = data['y']
-    S[i,:,:] = data['s']
-    s_x = data['s_x']
-    s_y = data['s_y']
+# Save final arrays
+print("Saving final arrays...")
+np.savez_compressed('final_data.npz', inputs=inputs, outputs=outputs)
 
-    case = dname.split('_')[0]
-    Ma[i,:,:] = np.ones((256, 256))*aero_dict[case]['mach']
-    Re[i,:,:] = np.ones((256, 256))*aero_dict[case]['reynolds']
+# Clean up temporary files
+print("Cleaning up temporary files...")
+for chunk_idx in range(num_chunks):
+    os.remove(f'temp_chunks/chunk_{chunk_idx}.npz')
+os.rmdir('temp_chunks')
 
-    # Output Data
-    data = np.load('fields/fields_'+dname+'.npz')
-    Xi = data['x']
-    Yi = data['y']
-    P[i,:,:] = data['p']
-    VX[i,:,:] = data['vx']
-    VY[i,:,:] = data['vy']
+print("Processing complete!")
 
-    # Get counters for storing inter/intra-bnatch indices
-    ibatch = i//nbatch
-    j = i % nbatch
-    print(ibatch, j)
-    inputs[ibatch, j, :, :, :] = np.stack([X[i,:,:], Y[i,:,:], S[i,:,:], Ma[i,:,:], Re[i,:,:]], axis=0)
-    outputs[ibatch, j, :, :, :] = np.stack([P[i,:,:], VX[i,:,:], VY[i,:,:]], axis=0)
+sys.exit('DEBUG')
 
+'''
 stats_dict = {'x': [X.mean(), X.std()],\
               'y': [Y.mean(), Y.std()],\
               's': [S.mean(), S.std()],\
@@ -111,77 +158,11 @@ stats_dict = {'x': [X.mean(), X.std()],\
 
 print(inputs.shape)
 print(outputs.shape)
+sys.exit('DEBUG')
 
 np.save('inputs_train.npy', inputs)
 np.save('outputs_train.npy', outputs)
 with open('stats_dict.pkl', 'wb') as f:
     pickle.dump(stats_dict, f)
 
-fig, axs = plt.subplots(nrows=6, ncols=5, figsize=(12,16))
-
-batch_idx = [0, 3, 9]
-idx = [2, 13, 26]
-
-for i in range(3):
-    ii = 2*i
-    for j in range(5):
-        axs[ii,j].contourf(inputs[batch_idx[i],idx[i],j,:,:], levels=14, colors='k')
-        cntr = axs[ii, j].contourf(inputs[batch_idx[i],idx[i],j,:,:], levels=14, cmap="RdBu_r")
-        
-        # Add colorbar above each subplot in first row
-        divider = make_axes_locatable(axs[ii,j])
-        cax = divider.append_axes('top', size='5%', pad=0.05)
-        fig.colorbar(cntr, cax=cax, orientation='horizontal')
-        cax.xaxis.set_ticks_position('top')  # Put ticks on top
-
-    for j in range(3):
-        axs[ii+1,j].contourf(outputs[batch_idx[i],idx[i],j,:,:], levels=14, colors='k')
-        cntr = axs[ii+1, j].contourf(outputs[batch_idx[i],idx[i],j,:,:], levels=14, cmap="RdBu_r")
-
-        # Add colorbar below each subplot in second row
-        divider = make_axes_locatable(axs[ii+1, j])
-        cax = divider.append_axes('bottom', size='5%', pad=0.05)
-        fig.colorbar(cntr, cax=cax, orientation='horizontal')
-
-for ax in axs.flat:
-    ax.set_xticks([])
-    ax.set_yticks([])
-
-plt.tight_layout()
-plt.savefig('input_output.png')
-plt.close()
-
-del inputs, outputs, X, Y, S, Ma, Re, P, VX, VY
-
-print('HERE')
-
-Ma = np.zeros((Nval, 256, 256))
-Re = np.zeros((Nval, 256, 256))
-inputs_val = np.zeros((Nval//nbatch+1, nbatch, 5, 256, 256))
-outputs_val = np.zeros((Nval//nbatch+1, nbatch, 3, 256, 256))
-
-ibatch = 0
-for i, dname in enumerate(val_split):
-    # Get counters for storing inter/intra-bnatch indices
-    ibatch = i//nbatch
-    j = i % nbatch
-
-    # Input data
-    data = np.load('sdfs/sdf_'+dname+'.npz')
-    case = dname.split('_')[0]
-    Ma[i,:,:] = np.ones((256, 256))*aero_dict[case]['mach']
-    Re[i,:,:] = np.ones((256, 256))*aero_dict[case]['reynolds']
-    inputs_val[ibatch, j, :, :, :] = np.stack([data['x'], data['y'], data['s'], Ma[i,:,:], Re[i,:,:]], axis=0)
-
-    # Output Data
-    data = np.load('fields/fields_'+dname+'.npz')
-    Xi = data['x']
-    Yi = data['y']
-    outputs_val[ibatch, j, :, :, :] = np.stack([data['p'], data['vx'], data['vy']], axis=0)
-
-np.save('inputs_val.npy', inputs_val)
-np.save('outputs_val.npy', outputs_val)
-with open('data_counts.txt', 'w') as f:
-  f.write('%d\n' % Ntrain)
-  f.write('%d\n' % Nval)
-  f.write('%d' % Ntest)
+'''
